@@ -14,7 +14,6 @@ class Maze:
         self.visit = [[False for _ in range(self.col)] for _ in range(self.row)]
         
     def disable(self, row, col, direction):
-        
         self.cell[row][col][direction] = 0
         
         if direction == 0 and row > 0: #top
@@ -57,10 +56,9 @@ class Maze:
             col = random.randint(1, self.col-2)
             d = random.randint(0, 3)
             self.disable(row, col, d)
-            self.render(key=3)
+            #self.render(key=3)
         
     def imperfect2(self, size=7, num=10):
-        
         p = [[random.randint(1, self.row-size-1), random.randint(1, self.row-size-1)] for i in range(num)]
         
         for x, y in p:
@@ -73,7 +71,7 @@ class Maze:
                     for k in range(4):
                         self.cell[i][j][k] = 0
             
-            self.render(key=30)
+            #self.render(key=30)
             
             
     def dfs(self, row, col):
@@ -95,19 +93,19 @@ class Maze:
             
             if choice == 0 and self.visit[row-1][col] == False:
                 self.disable(row, col, choice)
-                self.render(key=3)
+                #self.render(key=3)
                 self.dfs(row-1, col)
             elif choice == 1 and self.visit[row][col-1] == False:
                 self.disable(row, col, choice)
-                self.render(key=3)
+                #self.render(key=3)
                 self.dfs(row, col-1)
             elif choice == 2 and self.visit[row+1][col] == False:
                 self.disable(row, col, choice)
-                self.render(key=3)
+                #self.render(key=3)
                 self.dfs(row+1, col)
             elif choice == 3 and self.visit[row][col+1] == False:
                 self.disable(row, col, choice)
-                self.render(key=3)
+                #self.render(key=3)
                 self.dfs(row, col+1)
 
 
