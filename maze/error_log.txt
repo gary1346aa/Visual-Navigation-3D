@@ -1,0 +1,12 @@
+Traceback (most recent call last):
+  File "<ipython-input-5-865c783072d7>", line 309, in <module>
+    while MazeGame(Maze.generate(width, height)).play(): pass
+  File "<ipython-input-5-865c783072d7>", line 280, in play
+    console.display(str(self.maze))
+AttributeError: module 'console' has no attribute 'display'
+Traceback (most recent call last):
+  File "genmaze.py", line 309, in <module>
+    while MazeGame(Maze.generate(width, height)).play(): pass
+  File "genmaze.py", line 280, in play
+    console.display(str(self.maze))
+AttributeError: module 'console' has no attribute 'display'
