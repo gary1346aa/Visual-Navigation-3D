@@ -4,11 +4,15 @@ from torch.optim import Adam
 import gym
 import time
 import core as core
+import cv2
 from logx import EpochLogger
 from mpi_pytorch import setup_pytorch_for_mpi, sync_params, mpi_avg_grads
 from mpi_tools import mpi_fork, mpi_avg, proc_id, mpi_statistics_scalar, num_procs
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+RENDER = False
+BONUS = False
 
 class PPOBuffer:
     """
@@ -88,8 +92,11 @@ class PPOBuffer:
 
 def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0, 
         steps_per_epoch=4000, epochs=50, gamma=0.99, clip_ratio=0.2, pi_lr=3e-4,
-        vf_lr=1e-3, train_pi_iters=80, train_v_iters=80, lam=0.95, max_ep_len=1000,
+        vf_lr=1e-3, train_pi_iters=80, train_v_iters=80, lam=0.97, max_ep_len=2000,
         target_kl=0.01, logger_kwargs=dict(), save_freq=10):
+
+    global RENDER, BONUS
+
     """
     Proximal Policy Optimization (by clipping), 
 
@@ -193,6 +200,11 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
 
     """
 
+    # Reachability Trainer
+    r_network = R_Network().to(device)
+    trainer = R_Network_Trainer(r_network=r_network, exp_name="random1")
+    episodic_memory = EpisodicMemory(embedding_shape=[EMBEDDING_DIM])
+
     # Special function to avoid certain slowdowns from PyTorch + MPI combo.
     setup_pytorch_for_mpi()
 
@@ -207,12 +219,13 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
 
     # Instantiate environment
     env = env_fn()
-    obs_dim = env.observation_space['image'].shape
-    act_dim = env.action_space.shape
+    observation_space = gym.spaces.Box(low=0.0, high=1.0, shape=(3, 64, 64))
+    action_space = gym.spaces.Discrete(3)
+    obs_dim = observation_space.shape
+    act_dim = action_space.shape
 
     # Create actor-critic module
-    ac = actor_critic(env.observation_space, env.action_space, **ac_kwargs)
-    rnd = core.RND(np.prod(obs_dim), 64, 64)
+    ac = actor_critic(observation_space, action_space, **ac_kwargs)
 
     # Sync params across processes
     sync_params(ac)
@@ -223,15 +236,11 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
 
     # Set up experience buffer
     local_steps_per_epoch = int(steps_per_epoch / num_procs())
-
     buf = PPOBuffer(obs_dim, act_dim, local_steps_per_epoch, gamma, lam)
 
     # Set up function for computing PPO policy loss
     def compute_loss_pi(data):
         obs, act, adv, logp_old = data['obs'], data['act'], data['adv'], data['logp']
-
-        # Flatten observation to 1d array
-        obs = obs.reshape(obs.shape[0], -1)
 
         # Policy loss
         pi, logp = ac.pi(obs, act)
@@ -251,28 +260,14 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     # Set up function for computing value loss
     def compute_loss_v(data):
         obs, ret = data['obs'], data['ret']
-        # Flatten observation to 1d array
-        obs = obs.reshape(obs.shape[0], -1)
         return ((ac.v(obs) - ret)**2).mean()
 
     # Set up optimizers for policy and value function
     pi_optimizer = Adam(ac.pi.parameters(), lr=pi_lr)
     vf_optimizer = Adam(ac.v.parameters(), lr=vf_lr)
-    RND_optimizer = Adam(rnd.get_param(), lr=1e-4)
 
     # Set up model saving
     logger.setup_pytorch_saver(ac)
-
-    def RNDupdate(data): #TODO
-        obs = data['obs']
-        obs = obs.reshape(obs.shape[0], -1)
-
-        for i in range(80):
-            RND_optimizer.zero_grad()
-            loss = rnd.compute_loss(obs)
-            loss.backward()
-            mpi_avg_grads(rnd.pred_net)
-            RND_optimizer.step()
 
     def update():
         data = buf.get()
@@ -285,6 +280,8 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         for i in range(train_pi_iters):
             pi_optimizer.zero_grad()
             loss_pi, pi_info = compute_loss_pi(data)
+            # Entropy bonus
+            loss_pi += pi_info['ent'] * 0.0021
             kl = mpi_avg(pi_info['kl'])
             if kl > 1.5 * target_kl:
                 logger.log('Early stopping at step %d due to reaching max kl.'%i)
@@ -310,31 +307,66 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
                      DeltaLossPi=(loss_pi.item() - pi_l_old),
                      DeltaLossV=(loss_v.item() - v_l_old))
 
-        RNDupdate(data)
-
     # Prepare for interaction with environment
     start_time = time.time()
-    o, ep_ret, ep_len = env.reset(), 0, 0
+    o, _ = env.reset()
+    env.render()
+    o = o.astype(np.float32) / 255.
+    o = o.transpose(2,0,1)
+    ep_ret, ep_len = 0, 0
+    indices = []
 
     # Main loop: collect experience in env and update/log each epoch
     for epoch in range(epochs):
-        rnd.eval()
         for t in range(local_steps_per_epoch):
-            a, v, logp = ac.step(torch.as_tensor(o['image'].flatten(), dtype=torch.float32))
-            next_o, r, d, _ = env.step(a)
-            
-            # TODO: intrinsic reward (RND?)
-            with torch.no_grad():
-                r_i = rnd.compute_loss(torch.as_tensor(next_o['image'].flatten(), dtype=torch.float32).unsqueeze(0))
-            r += r_i
+            state = torch.as_tensor(o[np.newaxis,...], dtype=torch.float32)
+            a, v, logp = ac.step(state)
 
-            ep_ret += r
+            next_o, r, d, info = env.step(a)
+            next_o = next_o.astype(np.float32) / 255.
+
+            d = ep_len == max_ep_len
+            trainer.store_new_state([next_o], [r], [d], [None])
+
+            r_network.eval()
+            with torch.no_grad():
+                state_embedding = r_network.embed_observation(torch.FloatTensor([o]).to(device)).cpu().numpy()[0]
+                aggregated, _, _ = similarity_to_memory(state_embedding, episodic_memory, r_network)
+                curiosity_bonus = 0.03 * (0.5 - aggregated)
+                if BONUS:
+                    print(f'{curiosity_bonus:.3f}')
+                if curiosity_bonus > 0 or len(episodic_memory) == 0:
+                    idx = episodic_memory.store_new_state(state_embedding)
+                    x = int(env.map_scale*info['pose']['x'])
+                    y = int(env.map_scale*info['pose']['y'])
+                    if idx == len(indices):
+                        indices.append((x, y))
+                    else:
+                        indices[idx] = (x, y)
+
+            r_network.train()
+            
+            next_o = next_o.transpose(2,0,1)
+            ep_ret += r + curiosity_bonus
             ep_len += 1
 
             # save and log
-            buf.store(o['image'], a, r, v, logp)
+            buf.store(o, a, r, v, logp)
             logger.store(VVals=v)
             
+            k = cv2.waitKey(1)
+            if k == ord('s'):
+                RENDER = 1 - RENDER
+            elif k == ord('b'):
+                BONUS = 1 - BONUS
+            
+            if RENDER:
+                env.info['map'] = cv2.flip(env.info['map'], 0)
+                for index in indices:
+                    cv2.circle(env.info['map'], index, 3, (0, 0, 255), -1)
+                env.info['map'] = cv2.flip(env.info['map'], 0)
+                env.render()
+
             # Update obs (critical!)
             o = next_o
 
@@ -347,60 +379,74 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
                     print('Warning: trajectory cut off by epoch at %d steps.'%ep_len, flush=True)
                 # if trajectory didn't reach terminal state, bootstrap value target
                 if timeout or epoch_ended:
-                    _, v, _ = ac.step(torch.as_tensor(o['image'].flatten(), dtype=torch.float32))
+                    state = torch.as_tensor(o[np.newaxis,...], dtype=torch.float32)
+                    _, v, _ = ac.step(state)
                 else:
                     v = 0
                 buf.finish_path(v)
                 if terminal:
                     # only save EpRet / EpLen if trajectory finished
                     logger.store(EpRet=ep_ret, EpLen=ep_len)
-                o, ep_ret, ep_len = env.reset(), 0, 0
+                print(ep_ret, ep_len, len(episodic_memory))
+                ep_ret, ep_len = 0, 0
+                o, _ = env.reset()
+                o = o.astype(np.float32) / 255.
+                o = o.transpose(2,0,1)
+                episodic_memory.reset()
+                indices = []
 
         # Save model
         if (epoch % save_freq == 0) or (epoch == epochs-1):
             logger.save_state({'env': env}, None)
 
         # Perform PPO update!
-        update()
-        rnd.train()
+        if epoch > 4:
+            update()
+            # Log info about epoch
+            logger.log_tabular('Epoch', epoch)
+            logger.log_tabular('EpRet', with_min_and_max=True)
+            logger.log_tabular('EpLen', average_only=True)
+            logger.log_tabular('VVals', with_min_and_max=True)
+            logger.log_tabular('TotalEnvInteracts', (epoch+1)*steps_per_epoch)
+            logger.log_tabular('LossPi', average_only=True)
+            logger.log_tabular('LossV', average_only=True)
+            logger.log_tabular('DeltaLossPi', average_only=True)
+            logger.log_tabular('DeltaLossV', average_only=True)
+            logger.log_tabular('Entropy', average_only=True)
+            logger.log_tabular('KL', average_only=True)
+            logger.log_tabular('ClipFrac', average_only=True)
+            logger.log_tabular('StopIter', average_only=True)
+            logger.log_tabular('Time', time.time()-start_time)
+            logger.dump_tabular()
 
-        # Log info about epoch
-        logger.log_tabular('Epoch', epoch)
-        logger.log_tabular('EpRet', with_min_and_max=True)
-        logger.log_tabular('EpLen', average_only=True)
-        logger.log_tabular('VVals', with_min_and_max=True)
-        logger.log_tabular('TotalEnvInteracts', (epoch+1)*steps_per_epoch)
-        logger.log_tabular('LossPi', average_only=True)
-        logger.log_tabular('LossV', average_only=True)
-        logger.log_tabular('DeltaLossPi', average_only=True)
-        logger.log_tabular('DeltaLossV', average_only=True)
-        logger.log_tabular('Entropy', average_only=True)
-        logger.log_tabular('KL', average_only=True)
-        logger.log_tabular('ClipFrac', average_only=True)
-        logger.log_tabular('StopIter', average_only=True)
-        logger.log_tabular('Time', time.time()-start_time)
-        logger.dump_tabular()
+        else:
+            buf.get()
+
+
 
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--env', type=str, default='MiniGrid-KeyCorridorS3R3-v0')
+    parser.add_argument('--env', type=str, default="MazeBoardRandom")
     parser.add_argument('--hid', type=int, default=64)
     parser.add_argument('--l', type=int, default=2)
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--seed', '-s', type=int, default=0)
-    parser.add_argument('--cpu', type=int, default=4)
+    parser.add_argument('--cpu', type=int, default=1)
     parser.add_argument('--steps', type=int, default=4000)
-    parser.add_argument('--epochs', type=int, default=200)
+    parser.add_argument('--epochs', type=int, default=5000)
     parser.add_argument('--exp_name', type=str, default='ppo')
     args = parser.parse_args()
 
     mpi_fork(args.cpu)  # run parallel code with mpi
-    from gym_minigrid.wrappers import *
+
     from run_utils import setup_logger_kwargs
+    from maze3d.maze_env import MazeBaseEnv, make
+    from reachability import *
+    import maze3d.maze
     logger_kwargs = setup_logger_kwargs(args.exp_name, args.seed)
 
-    ppo(lambda : gym.make(args.env), actor_critic=core.MLPActorCritic,
+    ppo(lambda : MazeBaseEnv(make(args.env), render_res=(64, 64)), actor_critic=core.CNNActorCritic,
         ac_kwargs=dict(hidden_sizes=[args.hid]*args.l), gamma=args.gamma, 
         seed=args.seed, steps_per_epoch=args.steps, epochs=args.epochs,
         logger_kwargs=logger_kwargs)

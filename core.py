@@ -23,6 +23,27 @@ def mlp(sizes, activation, output_activation=nn.Identity):
     return nn.Sequential(*layers)
 
 
+def cnn(channels, out_channels, output_activation=nn.Identity):
+
+    layers = nn.Sequential(
+        nn.Conv2d(3, channels, kernel_size=3, stride=1, padding=1),
+        nn.MaxPool2d(2, stride=2),
+        nn.ReLU(),
+        nn.Conv2d(channels, 2*channels, kernel_size=3, stride=1, padding=1),
+        nn.MaxPool2d(2, stride=2),
+        nn.ReLU(),
+        nn.Conv2d(2*channels, 4*channels, kernel_size=3, stride=1, padding=1),
+        nn.MaxPool2d(2, stride=2),
+        nn.ReLU(),
+        nn.Flatten(),
+        nn.Linear(4*channels*64, 512),
+        nn.ReLU(),
+        nn.Linear(512, out_channels),
+        output_activation()
+    )
+
+    return layers
+
 def count_vars(module):
     return sum([np.prod(p.shape) for p in module.parameters()])
 
@@ -78,6 +99,20 @@ class MLPCategoricalActor(Actor):
         return pi.log_prob(act)
 
 
+class CNNCategoricalActor(Actor):
+
+    def __init__(self, channels, act_dim):
+        super().__init__()
+        self.logits_net = cnn(channels, out_channels=act_dim)
+
+    def _distribution(self, obs):
+        logits = self.logits_net(obs)
+        return Categorical(logits=logits)
+
+    def _log_prob_from_distribution(self, pi, act):
+        return pi.log_prob(act)
+
+
 class MLPGaussianActor(Actor):
 
     def __init__(self, obs_dim, act_dim, hidden_sizes, activation):
@@ -104,6 +139,14 @@ class MLPCritic(nn.Module):
     def forward(self, obs):
         return torch.squeeze(self.v_net(obs), -1) # Critical to ensure v has right shape.
 
+class CNNCritic(nn.Module):
+
+    def __init__(self, channels):
+        super().__init__()
+        self.v_net = cnn(channels, out_channels=1)
+
+    def forward(self, obs):
+        return torch.squeeze(self.v_net(obs), -1)
 
 
 class MLPActorCritic(nn.Module):
@@ -113,8 +156,8 @@ class MLPActorCritic(nn.Module):
                  hidden_sizes=(64,64), activation=nn.Tanh):
         super().__init__()
 
-        #obs_dim = observation_space.shape[0]
-        obs_dim = np.prod(observation_space['image'].shape)
+        obs_dim = observation_space.shape[0]
+        #obs_dim = np.prod(observation_space['image'].shape)
 
         # policy builder depends on action space
         if isinstance(action_space, Box):
@@ -136,6 +179,33 @@ class MLPActorCritic(nn.Module):
     def act(self, obs):
         return self.step(obs)[0]
 
+
+class CNNActorCritic(nn.Module):
+
+    def __init__(self, observation_space, action_space, 
+                 hidden_sizes=(64,64), activation=nn.Tanh):
+        super().__init__()
+
+        channels = observation_space.shape[0]
+
+        self.pi = CNNCategoricalActor(channels, action_space.n)
+        # build value function
+        self.v  = CNNCritic(channels)
+
+    def step(self, obs):
+        with torch.no_grad():
+            pi = self.pi._distribution(obs)
+            a = pi.sample()
+            logp_a = self.pi._log_prob_from_distribution(pi, a)
+            v = self.v(obs)
+        return a.numpy(), v.numpy(), logp_a.numpy()
+
+    def act(self, obs):
+        return self.step(obs)[0]
+
+
+
+
 class RNDNetwork(nn.Module):
 
     def __init__(self, obs_dim, hidden_dim, feature_dim):
@@ -153,9 +223,10 @@ class RNDNetwork(nn.Module):
     def forward(self, obs):
         return self.model(obs)
 
-class RND:
+class RND(nn.Module):
 
     def __init__(self, obs_dim, hidden_dim, feature_dim):
+        super().__init__()
         self.target_net = RNDNetwork(obs_dim, hidden_dim, feature_dim)
         self.pred_net = RNDNetwork(obs_dim, hidden_dim, feature_dim)
 
@@ -196,7 +267,6 @@ class StateEmbeddingNet(nn.Module):
 
         obs_embedding = x.view(T, B, -1)
         return obs_embedding
-
 
 class ForwardDynamicsNet(nn.Module):
     def __init__(self, act_dim):
@@ -247,7 +317,6 @@ class InverseDynamicsNet(nn.Module):
         )
         loss = loss.view_as(action)
         return torch.sum(torch.mean(loss, dim=1))
-
 
 class ICM:
     def __init__(self, obs_dim,  act_dim, beta=0.2):

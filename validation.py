@@ -1,28 +1,29 @@
-import gym
-from gym_minigrid.wrappers import *
 import torch
 import time
 import random
+import cv2
+import numpy as np
+from maze3d.maze_env import MazeBaseEnv, make
 
-model = torch.load(r'../data/MiniGrid-MultiRoom-N4-S5-v0-RNDPPO/MiniGrid-MultiRoom-N4-S5-v0-RNDPPO_s0/pyt_save/model.pt')
-env = gym.make('MiniGrid-MultiRoom-N4-S5-v0')
-env.seed(random.randint(0, 100))
-action_dict = {i: a.name for i, a in enumerate(env.actions)}
+
+model = torch.load(r'../data/ppo/ppo_s0/pyt_save/model.pt')
+env = MazeBaseEnv(make("MazeBoardRandom"), render_res = (64, 64))
 
 epi_return, epi_count = 0, 0
-o = env.reset()['image'].flatten()
+o, _ = env.reset()
 
 while epi_count < 10:
-    a, v, logp = model.step(torch.as_tensor(o, dtype=torch.float32))
+    o = o.astype(np.float32) / 255.
+    o = o.transpose(2,0,1)
+    state = torch.as_tensor(o[np.newaxis,...], dtype=torch.float32)
+    a, v, logp = model.step(state)
     env.render()
     o, r, done, _ = env.step(a) # take a random action
-    o = o['image'].flatten()
     epi_return += r
-
-    #print(action_dict[a.item(0)])
+    cv2.waitKey(10)
     if done:
         print(f'Done episode #{epi_count+1}, episodic return = {epi_return:.3f}')
-        o = env.reset()['image'].flatten()
+        o = env.reset()
         epi_return = 0
         epi_count += 1
         continue
